@@ -43,6 +43,70 @@ router = APIRouter()
 
 password_hash = PasswordHash.recommended()
 
+
+# ============================================
+# SEND OTP EMAIL
+# ============================================
+
+async def send_otp_email(
+    to_email: str,
+    username: str,
+    otp: str
+):
+
+    # Get email settings from Environment Variables
+    smtp_host = os.getenv("EMAIL_HOST")
+    smtp_port = int(os.getenv("EMAIL_PORT", "587"))
+    smtp_username = os.getenv("EMAIL_USERNAME")
+    smtp_password = os.getenv("EMAIL_PASSWORD")
+
+    # Check email configuration
+    if not smtp_host:
+        raise RuntimeError("EMAIL_HOST is missing")
+
+    if not smtp_username:
+        raise RuntimeError("EMAIL_USERNAME is missing")
+
+    if not smtp_password:
+        raise RuntimeError("EMAIL_PASSWORD is missing")
+
+    # Create email
+    message = EmailMessage()
+
+    message["From"] = smtp_username
+    message["To"] = to_email
+    message["Subject"] = "TaskFlow - Email Verification OTP"
+
+    message.set_content(
+        f"""
+Hello {username},
+
+Welcome to TaskFlow!
+
+Your email verification OTP is:
+
+{otp}
+
+This OTP will expire in 10 minutes.
+
+If you did not create this account, you can ignore this email.
+
+Regards,
+TaskFlow Team
+"""
+    )
+
+    # Send email through Gmail SMTP
+    await aiosmtplib.send(
+        message,
+        hostname=smtp_host,
+        port=smtp_port,
+        username=smtp_username,
+        password=smtp_password,
+        start_tls=True
+    )
+
+
 # ============================================
 # 1. REGISTER + SEND OTP
 # ============================================
@@ -53,7 +117,10 @@ async def register(
     db=Depends(get_db)
 ):
 
+    # ----------------------------------------
     # Check existing username
+    # ----------------------------------------
+
     existing_user = db.query(User).filter(
         User.username == user_data.username
     ).first()
@@ -64,7 +131,10 @@ async def register(
             detail="Username already exists"
         )
 
+    # ----------------------------------------
     # Check existing email
+    # ----------------------------------------
+
     existing_email = db.query(User).filter(
         User.email == user_data.email
     ).first()
@@ -75,7 +145,10 @@ async def register(
             detail="Email already exists"
         )
 
+    # ----------------------------------------
     # Generate 6-digit OTP
+    # ----------------------------------------
+
     otp = f"{secrets.randbelow(1000000):06d}"
 
     # OTP expires after 10 minutes
@@ -84,13 +157,18 @@ async def register(
         + timedelta(minutes=10)
     ).isoformat()
 
+    # ----------------------------------------
     # Hash password
+    # ----------------------------------------
+
     hashed_password = password_hash.hash(
         str(user_data.password)
     )
 
-    # If an unverified user already exists,
-    # update their registration details.
+    # ----------------------------------------
+    # Update existing unverified user
+    # ----------------------------------------
+
     if existing_user:
 
         existing_user.email = user_data.email
@@ -99,6 +177,10 @@ async def register(
         existing_user.otp_expiry = otp_expiry
 
         user = existing_user
+
+    # ----------------------------------------
+    # Create new user
+    # ----------------------------------------
 
     else:
 
@@ -113,45 +195,33 @@ async def register(
 
         db.add(user)
 
+    # Save user
     db.commit()
     db.refresh(user)
 
-    # ========================================
-    # SEND OTP EMAIL
-    # ========================================
+    # ----------------------------------------
+    # SEND OTP TO USER EMAIL
+    # ----------------------------------------
 
-    message = EmailMessage()
+    try:
 
-    message["From"] = os.getenv("SMTP_USERNAME")
-    message["To"] = user_data.email
-    message["Subject"] = "Your Task Manager Verification Code"
+        await send_otp_email(
+            to_email=user_data.email,
+            username=user_data.username,
+            otp=otp
+        )
 
-    message.set_content(
-        f"""
-Hello {user_data.username},
+    except Exception as error:
 
-Your verification OTP is:
+        print("Email sending failed:", error)
 
-{otp}
-
-This OTP will expire in 10 minutes.
-
-If you did not create this account, you can ignore this email.
-
-Regards,
-Task Manager
-"""
-    )
-
-      # Development OTP
-    # For now, show OTP in the terminal instead of sending an email.
-    print("=" * 40)
-    print(f"OTP for {user_data.username}: {otp}")
-    print("OTP expires in 10 minutes.")
-    print("=" * 40)
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to send OTP email. Please try again."
+        )
 
     return {
-        "message": "OTP generated successfully. Check the terminal for your OTP."
+        "message": "OTP sent successfully to your email."
     }
 
 
@@ -171,38 +241,49 @@ def verify_otp(
     ).first()
 
     if not user:
+
         raise HTTPException(
             status_code=404,
             detail="User not found"
         )
 
     if user.is_verified:
+
         raise HTTPException(
             status_code=400,
             detail="Account is already verified"
         )
 
+    # Check OTP
     if user.otp != otp:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid OTP"
         )
 
+    # ----------------------------------------
     # Check OTP expiry
+    # ----------------------------------------
+
     expiry_time = datetime.fromisoformat(
         user.otp_expiry
     )
 
     if datetime.now(timezone.utc) > expiry_time:
+
         raise HTTPException(
             status_code=400,
             detail="OTP has expired"
         )
 
+    # ----------------------------------------
     # Verify account
+    # ----------------------------------------
+
     user.is_verified = True
 
-    # Remove OTP after successful verification
+    # Remove OTP after verification
     user.otp = None
     user.otp_expiry = None
 
@@ -212,8 +293,9 @@ def verify_otp(
         "message": "Email verified successfully. Account created."
     }
 
+
 # ============================================
-# 2. LOGIN
+# 3. LOGIN
 # ============================================
 
 @router.post(
@@ -225,7 +307,10 @@ def login(
     db=Depends(get_db)
 ):
 
+    # ----------------------------------------
     # Find user
+    # ----------------------------------------
+
     user = db.query(User).filter(
         User.username == form_data.username
     ).first()
@@ -237,7 +322,10 @@ def login(
             detail="Invalid username or password"
         )
 
+    # ----------------------------------------
     # Check email verification
+    # ----------------------------------------
+
     if not user.is_verified:
 
         raise HTTPException(
@@ -245,7 +333,10 @@ def login(
             detail="Please verify your email before login"
         )
 
+    # ----------------------------------------
     # Verify password
+    # ----------------------------------------
+
     password_correct = password_hash.verify(
         form_data.password,
         user.password
@@ -258,23 +349,20 @@ def login(
             detail="Invalid username or password"
         )
 
-    # ========================================
+    # ----------------------------------------
     # JWT PAYLOAD
-    # ========================================
+    # ----------------------------------------
 
     payload = {
-
         "user_id": user.id,
-
         "username": user.username,
-
         "exp": datetime.now(timezone.utc)
         + timedelta(minutes=30)
     }
 
-    # ========================================
+    # ----------------------------------------
     # CREATE TOKEN
-    # ========================================
+    # ----------------------------------------
 
     token = jwt.encode(
         payload,
@@ -283,45 +371,13 @@ def login(
     )
 
     return {
-
         "access_token": token,
-
-        "token_type": "bearer"
-    }
-    # ========================================
-    # JWT PAYLOAD
-    # ========================================
-
-    payload = {
-
-        "user_id": user.id,
-
-        "username": user.username,
-
-        "exp": datetime.now(timezone.utc)
-        + timedelta(minutes=30)
-    }
-
-    # ========================================
-    # CREATE TOKEN
-    # ========================================
-
-    token = jwt.encode(
-        payload,
-        SECRET_KEY,
-        algorithm=ALGORITHM
-    )
-
-    return {
-
-        "access_token": token,
-
         "token_type": "bearer"
     }
 
 
 # ============================================
-# 3. PROTECTED PROFILE
+# 4. PROTECTED PROFILE
 # ============================================
 
 @router.get(
@@ -333,7 +389,6 @@ def profile(
     db=Depends(get_db)
 ):
 
-    # Find current user
     user = db.query(User).filter(
         User.id == current_user["user_id"]
     ).first()
@@ -349,7 +404,7 @@ def profile(
 
 
 # ============================================
-# 4. GET MY TASKS
+# 5. GET MY TASKS
 # ============================================
 
 @router.get("/users/me/tasks")
@@ -358,7 +413,6 @@ def get_my_tasks(
     db=Depends(get_db)
 ):
 
-    # Find current user
     user = db.query(User).filter(
         User.id == current_user["user_id"]
     ).first()
@@ -370,7 +424,6 @@ def get_my_tasks(
             detail="User not found"
         )
 
-    # Use SQLAlchemy relationship
     result = [
 
         {

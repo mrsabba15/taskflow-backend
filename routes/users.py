@@ -7,8 +7,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 
 import os
 import secrets
-import aiosmtplib
-from email.message import EmailMessage
+import requests
 
 from database import get_db
 from models import User
@@ -45,66 +44,74 @@ password_hash = PasswordHash.recommended()
 
 
 # ============================================
-# SEND OTP EMAIL
+# SEND OTP EMAIL USING RESEND
 # ============================================
 
-async def send_otp_email(
+def send_otp_email(
     to_email: str,
     username: str,
     otp: str
 ):
 
-    # Get email settings from Environment Variables
-    smtp_host = os.getenv("EMAIL_HOST")
-    smtp_port = int(os.getenv("EMAIL_PORT", "587"))
-    smtp_username = os.getenv("EMAIL_USERNAME")
-    smtp_password = os.getenv("EMAIL_PASSWORD")
+    # Get Resend API key from environment
+    resend_api_key = os.getenv("RESEND_API_KEY")
 
-    # Check email configuration
-    if not smtp_host:
-        raise RuntimeError("EMAIL_HOST is missing")
+    if not resend_api_key:
+        raise RuntimeError(
+            "RESEND_API_KEY is missing"
+        )
 
-    if not smtp_username:
-        raise RuntimeError("EMAIL_USERNAME is missing")
+    # Email data
+    payload = {
+        "from": "TaskFlow <onboarding@resend.dev>",
+        "to": [to_email],
+        "subject": "TaskFlow - Email Verification OTP",
+        "html": f"""
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+            <h2>Welcome to TaskFlow</h2>
 
-    if not smtp_password:
-        raise RuntimeError("EMAIL_PASSWORD is missing")
+            <p>Hello <strong>{username}</strong>,</p>
 
-    # Create email
-    message = EmailMessage()
+            <p>Your email verification OTP is:</p>
 
-    message["From"] = smtp_username
-    message["To"] = to_email
-    message["Subject"] = "TaskFlow - Email Verification OTP"
+            <h1 style="letter-spacing: 6px;">
+                {otp}
+            </h1>
 
-    message.set_content(
-        f"""
-Hello {username},
+            <p>
+                This OTP will expire in <strong>10 minutes</strong>.
+            </p>
 
-Welcome to TaskFlow!
+            <p>
+                If you did not create this account,
+                you can ignore this email.
+            </p>
 
-Your email verification OTP is:
+            <p>Regards,<br>TaskFlow Team</p>
+        </body>
+        </html>
+        """
+    }
 
-{otp}
-
-This OTP will expire in 10 minutes.
-
-If you did not create this account, you can ignore this email.
-
-Regards,
-TaskFlow Team
-"""
+    # Send request to Resend API
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {resend_api_key}",
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=20
     )
 
-    # Send email through Gmail SMTP
-    await aiosmtplib.send(
-        message,
-        hostname=smtp_host,
-        port=smtp_port,
-        username=smtp_username,
-        password=smtp_password,
-        start_tls=True
-    )
+    # Raise error if Resend rejects the request
+    if not response.ok:
+        raise RuntimeError(
+            f"Resend email failed: {response.text}"
+        )
+
+    return response.json()
 
 
 # ============================================
@@ -112,7 +119,7 @@ TaskFlow Team
 # ============================================
 
 @router.post("/register")
-async def register(
+def register(
     user_data: UserCreate,
     db=Depends(get_db)
 ):
@@ -139,7 +146,13 @@ async def register(
         User.email == user_data.email
     ).first()
 
-    if existing_email and existing_email.is_verified:
+    if (
+        existing_email
+        and existing_email.is_verified
+        and existing_email.id != (
+            existing_user.id if existing_user else None
+        )
+    ):
         raise HTTPException(
             status_code=400,
             detail="Email already exists"
@@ -166,7 +179,7 @@ async def register(
     )
 
     # ----------------------------------------
-    # Update existing unverified user
+    # Update existing unverified username
     # ----------------------------------------
 
     if existing_user:
@@ -195,17 +208,17 @@ async def register(
 
         db.add(user)
 
-    # Save user
+    # Save database changes
     db.commit()
     db.refresh(user)
 
     # ----------------------------------------
-    # SEND OTP TO USER EMAIL
+    # SEND OTP
     # ----------------------------------------
 
     try:
 
-        await send_otp_email(
+        send_otp_email(
             to_email=user_data.email,
             username=user_data.username,
             otp=otp
@@ -241,14 +254,12 @@ def verify_otp(
     ).first()
 
     if not user:
-
         raise HTTPException(
             status_code=404,
             detail="User not found"
         )
 
     if user.is_verified:
-
         raise HTTPException(
             status_code=400,
             detail="Account is already verified"
@@ -256,34 +267,26 @@ def verify_otp(
 
     # Check OTP
     if user.otp != otp:
-
         raise HTTPException(
             status_code=400,
             detail="Invalid OTP"
         )
 
-    # ----------------------------------------
     # Check OTP expiry
-    # ----------------------------------------
-
     expiry_time = datetime.fromisoformat(
         user.otp_expiry
     )
 
     if datetime.now(timezone.utc) > expiry_time:
-
         raise HTTPException(
             status_code=400,
             detail="OTP has expired"
         )
 
-    # ----------------------------------------
     # Verify account
-    # ----------------------------------------
-
     user.is_verified = True
 
-    # Remove OTP after verification
+    # Remove OTP after successful verification
     user.otp = None
     user.otp_expiry = None
 
@@ -307,10 +310,7 @@ def login(
     db=Depends(get_db)
 ):
 
-    # ----------------------------------------
     # Find user
-    # ----------------------------------------
-
     user = db.query(User).filter(
         User.username == form_data.username
     ).first()
@@ -322,10 +322,7 @@ def login(
             detail="Invalid username or password"
         )
 
-    # ----------------------------------------
     # Check email verification
-    # ----------------------------------------
-
     if not user.is_verified:
 
         raise HTTPException(
@@ -333,10 +330,7 @@ def login(
             detail="Please verify your email before login"
         )
 
-    # ----------------------------------------
     # Verify password
-    # ----------------------------------------
-
     password_correct = password_hash.verify(
         form_data.password,
         user.password
@@ -349,10 +343,7 @@ def login(
             detail="Invalid username or password"
         )
 
-    # ----------------------------------------
-    # JWT PAYLOAD
-    # ----------------------------------------
-
+    # JWT payload
     payload = {
         "user_id": user.id,
         "username": user.username,
@@ -360,10 +351,7 @@ def login(
         + timedelta(minutes=30)
     }
 
-    # ----------------------------------------
-    # CREATE TOKEN
-    # ----------------------------------------
-
+    # Create JWT
     token = jwt.encode(
         payload,
         SECRET_KEY,
@@ -425,14 +413,12 @@ def get_my_tasks(
         )
 
     result = [
-
         {
             "id": task.id,
             "title": task.title,
             "completed": task.completed,
             "user_id": task.user_id
         }
-
         for task in user.tasks
     ]
 

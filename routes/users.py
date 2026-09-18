@@ -53,22 +53,32 @@ def send_otp_email(
     otp: str
 ):
 
-    # Get Resend API key from environment
+    # Get Resend API key
     resend_api_key = os.getenv("RESEND_API_KEY")
 
-    if not resend_api_key:
+    # Sender email
+    resend_from_email = os.getenv(
+        "RESEND_FROM_EMAIL",
+        "TaskFlow <onboarding@resend.dev>"
+    )
+
+    if not resend_api_key or resend_api_key in {
+        "your_resend_api_key",
+        "PASTE_YOUR_RESEND_API_KEY_HERE"
+    }:
         raise RuntimeError(
-            "RESEND_API_KEY is missing"
+            "RESEND_API_KEY is missing or still uses the placeholder value"
         )
 
-    # Email data
+    # Email payload
     payload = {
-        "from": "TaskFlow <onboarding@resend.dev>",
+        "from": resend_from_email,
         "to": [to_email],
         "subject": "TaskFlow - Email Verification OTP",
         "html": f"""
         <html>
         <body style="font-family: Arial, sans-serif;">
+
             <h2>Welcome to TaskFlow</h2>
 
             <p>Hello <strong>{username}</strong>,</p>
@@ -80,7 +90,8 @@ def send_otp_email(
             </h1>
 
             <p>
-                This OTP will expire in <strong>10 minutes</strong>.
+                This OTP will expire in
+                <strong>10 minutes</strong>.
             </p>
 
             <p>
@@ -88,27 +99,47 @@ def send_otp_email(
                 you can ignore this email.
             </p>
 
-            <p>Regards,<br>TaskFlow Team</p>
+            <p>
+                Regards,<br>
+                TaskFlow Team
+            </p>
+
         </body>
         </html>
         """
     }
 
-    # Send request to Resend API
-    response = requests.post(
-        "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {resend_api_key}",
-            "Content-Type": "application/json"
-        },
-        json=payload,
-        timeout=20
-    )
+    try:
 
-    # Raise error if Resend rejects the request
-    if not response.ok:
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_api_key}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=20
+        )
+
+    except requests.RequestException as error:
+
+        print("Resend connection error:", error)
+
         raise RuntimeError(
-            f"Resend email failed: {response.text}"
+            "Could not connect to Resend."
+        )
+
+    # Resend rejected the request
+    if not response.ok:
+
+        print(
+            "Resend API error:",
+            response.status_code,
+            response.text
+        )
+
+        raise RuntimeError(
+            "Resend rejected the email request."
         )
 
     return response.json()
@@ -125,41 +156,78 @@ def register(
 ):
 
     # ----------------------------------------
-    # Check existing username
+    # Clean user input
+    # ----------------------------------------
+
+    username = user_data.username.strip()
+    email = user_data.email.strip().lower()
+
+    # ----------------------------------------
+    # Find username
     # ----------------------------------------
 
     existing_user = db.query(User).filter(
-        User.username == user_data.username
+        User.username == username
     ).first()
 
+    # ----------------------------------------
+    # Find email
+    # ----------------------------------------
+
+    existing_email = db.query(User).filter(
+        User.email == email
+    ).first()
+
+    # ----------------------------------------
+    # Username already verified
+    # ----------------------------------------
+
     if existing_user and existing_user.is_verified:
+
         raise HTTPException(
             status_code=400,
             detail="Username already exists"
         )
 
     # ----------------------------------------
-    # Check existing email
+    # Email already verified
     # ----------------------------------------
-
-    existing_email = db.query(User).filter(
-        User.email == user_data.email
-    ).first()
 
     if (
         existing_email
         and existing_email.is_verified
-        and existing_email.id != (
-            existing_user.id if existing_user else None
+        and (
+            not existing_user
+            or existing_email.id != existing_user.id
         )
     ):
+
         raise HTTPException(
             status_code=400,
             detail="Email already exists"
         )
 
     # ----------------------------------------
-    # Generate 6-digit OTP
+    # Username and email belong to
+    # different users
+    # ----------------------------------------
+
+    if (
+        existing_user
+        and existing_email
+        and existing_user.id != existing_email.id
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Username and email are associated "
+                "with different accounts"
+            )
+        )
+
+    # ----------------------------------------
+    # Generate OTP
     # ----------------------------------------
 
     otp = f"{secrets.randbelow(1000000):06d}"
@@ -179,27 +247,42 @@ def register(
     )
 
     # ----------------------------------------
-    # Update existing unverified username
+    # Reuse existing unverified user
     # ----------------------------------------
 
     if existing_user:
 
-        existing_user.email = user_data.email
-        existing_user.password = hashed_password
-        existing_user.otp = otp
-        existing_user.otp_expiry = otp_expiry
-
         user = existing_user
 
+        user.email = email
+        user.password = hashed_password
+        user.otp = otp
+        user.otp_expiry = otp_expiry
+        user.is_verified = False
+
     # ----------------------------------------
-    # Create new user
+    # Reuse existing unverified email record
+    # ----------------------------------------
+
+    elif existing_email:
+
+        user = existing_email
+
+        user.username = username
+        user.password = hashed_password
+        user.otp = otp
+        user.otp_expiry = otp_expiry
+        user.is_verified = False
+
+    # ----------------------------------------
+    # Create completely new user
     # ----------------------------------------
 
     else:
 
         user = User(
-            username=user_data.username,
-            email=user_data.email,
+            username=username,
+            email=email,
             password=hashed_password,
             is_verified=False,
             otp=otp,
@@ -208,19 +291,22 @@ def register(
 
         db.add(user)
 
-    # Save database changes
+    # ----------------------------------------
+    # Save user
+    # ----------------------------------------
+
     db.commit()
     db.refresh(user)
 
     # ----------------------------------------
-    # SEND OTP
+    # Send OTP email
     # ----------------------------------------
 
     try:
 
         send_otp_email(
-            to_email=user_data.email,
-            username=user_data.username,
+            to_email=email,
+            username=username,
             otp=otp
         )
 
@@ -230,7 +316,10 @@ def register(
 
         raise HTTPException(
             status_code=500,
-            detail="Unable to send OTP email. Please try again."
+            detail=(
+                "Unable to send OTP email. "
+                "Please try again."
+            )
         )
 
     return {
@@ -254,12 +343,14 @@ def verify_otp(
     ).first()
 
     if not user:
+
         raise HTTPException(
             status_code=404,
             detail="User not found"
         )
 
     if user.is_verified:
+
         raise HTTPException(
             status_code=400,
             detail="Account is already verified"
@@ -267,17 +358,19 @@ def verify_otp(
 
     # Check OTP
     if user.otp != otp:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid OTP"
         )
 
-    # Check OTP expiry
+    # Check expiry
     expiry_time = datetime.fromisoformat(
         user.otp_expiry
     )
 
     if datetime.now(timezone.utc) > expiry_time:
+
         raise HTTPException(
             status_code=400,
             detail="OTP has expired"
@@ -286,14 +379,17 @@ def verify_otp(
     # Verify account
     user.is_verified = True
 
-    # Remove OTP after successful verification
+    # Remove OTP
     user.otp = None
     user.otp_expiry = None
 
     db.commit()
 
     return {
-        "message": "Email verified successfully. Account created."
+        "message": (
+            "Email verified successfully. "
+            "Account created."
+        )
     }
 
 
@@ -322,12 +418,15 @@ def login(
             detail="Invalid username or password"
         )
 
-    # Check email verification
+    # Check verification
     if not user.is_verified:
 
         raise HTTPException(
             status_code=403,
-            detail="Please verify your email before login"
+            detail=(
+                "Please verify your email "
+                "before login"
+            )
         )
 
     # Verify password
@@ -347,11 +446,13 @@ def login(
     payload = {
         "user_id": user.id,
         "username": user.username,
-        "exp": datetime.now(timezone.utc)
-        + timedelta(minutes=30)
+        "exp": (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=30)
+        )
     }
 
-    # Create JWT
+    # Create token
     token = jwt.encode(
         payload,
         SECRET_KEY,
@@ -413,12 +514,14 @@ def get_my_tasks(
         )
 
     result = [
+
         {
             "id": task.id,
             "title": task.title,
             "completed": task.completed,
             "user_id": task.user_id
         }
+
         for task in user.tasks
     ]
 
